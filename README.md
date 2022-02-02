@@ -1,6 +1,8 @@
 # SFA OAM Linear
 Using the SFA to compute the orbital angular momentum of a photoelectron ionized via a strong linear sin^2 pulse laser field. This code is an edited verions of the circular code based on the results of this [preprint arXiv paper](https://arxiv.org/abs/2102.07453)
 
+**Now with the chiral hydrogen prefactor in the velocity and length gauge**
+
 To build on linux use the build.sh script, run:
 `./build.sh` in the directory
 

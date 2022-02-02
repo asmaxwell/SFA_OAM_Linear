@@ -1,7 +1,7 @@
 # distutils: language = c++
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-#Pulse version of the SFA for circular polarization
+#Pulse version of the SFA for linear polarization
 """
 Created on Tuesday Nov 24 10:29:00 2020
 
@@ -16,10 +16,15 @@ cimport scipy.special.cython_special as csp
 import mpmath as mp
 import functools
 import multiprocessing
+from sympy.physics.wigner import wigner_3j
+
 
 import numpy as np
 cimport numpy as np
 from numpy cimport ndarray
+from scipy.special import sph_harm, hyp2f1, lpmv, clpmn, lpmn
+import math
+import mpmath as mp
 
 cimport cython
 
@@ -55,6 +60,7 @@ cdef extern from "<complex.h>" namespace "std" nogil:
     #double complex cot(double complex z)
     double complex sqrt(double complex z)
     double complex acos(double complex z)
+    double complex atan(double complex z)
     double complex log(double complex z)
     double complex atan2(double complex z)
     #double complex pow(double complex z, c_dbl_int z)
@@ -68,9 +74,6 @@ cdef double rtPi = np.sqrt(Pi)
 cdef double rt2 = np.sqrt(2.)
 cdef int cacheSize = 2**20
 
-#Code to import old CQSFA prefactor code
-# cdef extern from "HpgForms.h":
-#     double complex calculateHMatrixElement(int target, double Ip, double complex pz, double px,  double complex ts, double complex Eft, double complex Aft, double theta)
 
 ### shorcut functions to efficntly switch trig between real and complex varients    
 cdef sin_c(dbl_or_cmplx t):
@@ -83,10 +86,8 @@ cdef cos_c(dbl_or_cmplx t):
             return cos_re(t)
         else:
             return cos(t)
-        
 cdef cot_c(dbl_or_cmplx t):
         return cos_c(t)/sin_c(t)
-
 
 
 
@@ -96,14 +97,15 @@ cdef class SFALinearPulse:
     '''
     #memeber variables like in C++!
     cdef readonly double Ip, Up, rtUp, omega, CEP, AlignmentAngle
-    cdef readonly int N, Target
+    cdef readonly int N, Gauge
+    cdef readonly list n, l, m, const1
     #cdef object __weakref__ # enable weak referencing support
     
-    def __init__(self, Ip_ = 0.5, Up_ = 0.44, omega_ = 0.057, N_ = 6, CEP_ = 0., Target_=3.):
+    def __init__(self, Ip_ = 0.5, Up_ = 0.44, omega_ = 0.057, N_ = 6, n_=[1], l_=[0], m_=[0], const1_=[1], CEP_ = 0., Gauge_=0):
         '''
             Initialise field and target parameters defaults correspond to 800nm wl and 2 10^14 W/cm^2 intensity
-            for the target 0=He, HeTheta=1, Ne=2, Ar=3, ArEx_4S=4, Xe=5, N2=6, N2Theta=7, O2Theta=8, H = 9 (and default case e.g. any other number)
-            The ionization prefactor must be set independently
+            Gauge_=0 (velocity gauge), Gauge_=1 (length gauge)
+
         '''
         #Set pulse and targetvparameters
         self.Ip = Ip_
@@ -111,12 +113,18 @@ cdef class SFALinearPulse:
         self.rtUp = np.sqrt(Up_) #must change this if Up is changed! Fixed by making Up readonly
         self.omega = omega_
         
+        #Target state parameters
+        self.n = n_
+        self.l = l_
+        self.m = m_
+        self.const1 = const1_
+        
         
         self.N = N_
         self.CEP = CEP_
+        self.Gauge = Gauge_
         
         self.AlignmentAngle = 0.
-        self.Target = Target_
     
         
     #@functools.lru_cache(maxsize=cacheSize)
@@ -221,7 +229,11 @@ cdef class SFALinearPulse:
         cdef dbl_or_cmplx linAI = p*cos_re(theta)*s.AfI(t)
         cdef dbl_or_cmplx quadAI = 0.5*s.Af2I(t)
         return tTerms + linAI + quadAI
-    
+    cpdef dbl_or_cmplx Sxy(s, double px, double py, double pz, dbl_or_cmplx t):
+        cdef double p = sqrt_re(px*px + py*py +pz*pz)
+        cdef double theta = acos_re(pz/p)
+        cdef double phi = atan2_re(py, px)
+        return s.S(p, theta, phi, t)
     
     cpdef dbl_or_cmplx DS(s, double p, double theta, double phi, dbl_or_cmplx t):
             cdef pz = p*cos_re(theta)
@@ -302,23 +314,156 @@ cdef class SFALinearPulse:
         '''Second order derivative of action wrt t'''
         return -(p*cos_re(theta)+s.Af(t))*s.Ef(t)
         
-
     
-# prefactor keep for future implementation    
-#     #@functools.lru_cache(maxsize=cacheSize)
-    cdef double complex d0(s, double p, double theta, double phi, double complex ts):
+    cpdef double complex d0_v(s, nlist, llist, mlist, constlist, double p, double theta, double phi):
         '''
-            Bound state prefactor will use GAMESS style gaussain orbitals'
+            Bound state prefactor in the velocity gauge <p|V|0> for a generic hydrogen wavefunction
         '''
-        #Dummy prefactor changes this!
-        return 1.
+        cdef double complex pref=0.
+        for n,l,m,const in zip(nlist,llist,mlist,constlist):
+            sum1=0.
+            for k in range(n-l):
+                term1=(-1)**k*math.factorial(n+l)*(2**k)*(2*s.Ip)**((-0.5-l)/2)*p**l
+                term2=math.factorial(n-l-k-1)*math.factorial(2*l+k+1)*math.factorial(k)
+                term3=math.gamma(2+k+2*l)/math.gamma(3/2+l)
+                term4=hyp2f1(1+l+k/2,(3+k+2*l)/2, l+3/2,-p**2/(2*s.Ip))
+                sum1=sum1+term1*term3*term4/term2
+            term5=(-1j)**l*math.sqrt(math.factorial(n-l-1)/(2*n*math.factorial(n+l)))
+            Yml=sph_harm(m,l,phi,theta)
+            pref=pref+term5*Yml*sum1*const
+        pref=pref/math.sqrt(len(nlist))
+        return pref
+    
+    
+    cpdef double complex d0_l(s, nlist, llist, mlist, constlist, double p, double theta, double phi, dbl_or_cmplx ts):
+        '''
+            Bound state prefactor in the length gauge <p+A(t)|V|0> for a generic hydrogen wavefunction
+        '''
+        cdef double px=p*sin_re(theta)*cos_re(phi), py=p*sin_re(theta)*sin_re(phi), pz=p*cos_re(theta)
+        cdef double sn = 1 if s.Af(ts).imag > 0 else -1
+        cdef double complex pz_2 = 1j*sn*sqrt_re(2*s.Ip + px**2+py**2)#pz+s.Af(ts) #tilde{pz}
+        cdef double complex pmod=  1j*sqrt_re(2*s.Ip)#sqrt(px**2+py**2+pz_2**2) #=modulus{tilde{p}}
+        cdef double complex pE=pz_2*s.Ef(ts) #=tilde{p}*E(ts)
+        cdef double complex sum1
+        cdef dbl_or_cmplx term1
+        cdef double complex Yml
+                                   
+        
+        cdef double complex pref=0.
+        for n,l,m,const in zip(nlist,llist,mlist,constlist):
+            sum1=0. 
+            for k in range(n-l):
+                term2=(-1)**k*math.factorial(n+l)*(2**k)*(2*s.Ip)**(3/4+l/2+k/2)*pmod**l
+                term3=(1j*pE)**((2+k+2*l)/4)
+                term4=math.factorial(n-l-k-1)*math.factorial(k)*math.gamma(3/2+l)*math.gamma(1+l+k/2)            
+                if k==0:
+                    term5=math.gamma((2+2*l)/4)              
+                elif k==1:
+                    F1=complex(mp.hyper([-1/4.,1/4.],[1/2.,(5+2*l)/4.],s.Ip**2/(1j*pE)))
+                    F2=complex(mp.hyper([1/4.,3/4.],[3/2.,(7+2*l)/4.],s.Ip**2/(1j*pE)))
+                    term5=math.gamma((3+2*l)/4)*F1-sqrt(4*s.Ip**2/(1j*pE))*math.gamma((5+2*l)/4)*F2/(3+2*l)
+                else:
+                    return np.nan
+                sum1=sum1+term2*term5/(term3*term4)       
+            
+            term1=(-1j)**l*math.sqrt(math.factorial(n-l-1)/(2*n*math.factorial(n+l)))
+            
+            if m>=0:
+                Yml=sqrt((2*l+1)*math.factorial(l-m)/(4*np.pi*math.factorial(m+l)))*exp(1j*m*phi) 
+                Yml=Yml*lpmn(m,l,pz_2.imag/pmod.imag)[0][m][l]  
+            else: 
+                #Yml=sqrt((2*l+1)*math.factorial(l-m)/(4*np.pi*math.factorial(m+l)))*exp(1j*m*(phi)) 
+                #Yml=Yml*(-1)**abs(m)*(math.factorial(l-abs(m))/math.factorial(l+abs(m)))*clpmn(abs(m),l,pz_2/pmod)[0][abs(m)][l] 
+                Yml=sqrt((2*l+1)*math.factorial(l-abs(m))/(4*np.pi*math.factorial(abs(m)+l)))*exp(1j*abs(m)*phi) 
+                Yml=Yml*lpmn(abs(m),l,pz_2.imag/pmod.imag)[0][abs(m)][l]  
+                Yml=((-1)**abs(m))*np.conj(Yml)
+            
+            pref=pref+term1*Yml*sum1*const
+        pref=pref/math.sqrt(len(nlist))
+        return pref#(-1j)**l*pmod**l/(1j*pE)**((2+k+2*l)/4)#
+   
+    
+    
+    
+    cpdef double complex Vm_v(s, int n, int l, int m, double p, double theta):
+        '''
+            Bound state prefactor in the velocity gauge <p|V|0> without exp(i*m*phi) for single nlm values
+        '''
+        cdef double complex pref=0.
+        cdef double complex sum1=0.
+        
+        for k in range(n-l):
+            term1=(-1)**k*math.factorial(n+l)*(2**k)*(2*s.Ip)**((-0.5-l)/2)*p**l
+            term2=math.factorial(n-l-k-1)*math.factorial(2*l+k+1)*math.factorial(k)
+            term3=math.gamma(2+k+2*l)/math.gamma(3/2+l)
+            term4=hyp2f1(1+l+k/2,(3+k+2*l)/2, l+3/2,-p**2/(2*s.Ip))
+            sum1=sum1+term1*term3*term4/term2
+        term5=(-1j)**l*math.sqrt(math.factorial(n-l-1)/(2*n*math.factorial(n+l)))
+        
+        if m>=0:
+            Yml=sqrt((2*l+1)*math.factorial(l-m)/(4*np.pi*math.factorial(m+l))) 
+            Yml=Yml*lpmn(m,l,cos_re(theta))[0][m][l]  
+        else: 
+            Yml=sqrt((2*l+1)*math.factorial(l-m)/(4*np.pi*math.factorial(m+l)))
+            Yml=Yml*(-1)**abs(m)*(math.factorial(l-abs(m))/math.factorial(l+abs(m)))*lpmn(abs(m),l,cos_re(theta))[0][abs(m)][l] 
+            
+        pref=term5*Yml*sum1
+        return pref
+    
+    
+    cpdef double complex Vm_l(s, int n, int l, int m, double p, double theta, dbl_or_cmplx ts):
+        '''
+            Bound state prefactor in the length gauge <p+A(t)|V|0> without exp(i*m*phi) for single nlm values
+        '''
+        cdef double pz=p*cos_re(theta)
+        cdef double sn = 1 if s.Af(ts).imag > 0 else -1
+        cdef double complex pz_2 = 1j*sn*sqrt_re(2*s.Ip + p**2 - pz**2) #tilde{pz}
+        cdef double complex pmod=  1j*sqrt_re(2*s.Ip) #=modulus{tilde{p}}
+        cdef double complex pE=pz_2*s.Ef(ts) #=tilde{p}*E(ts)
+        cdef double complex sum1
+        cdef dbl_or_cmplx term1
+        cdef double complex Yml
+        
+        cdef double complex pref=0.
+        
+        sum1=0. 
+        for k in range(n-l):
+            term2=(-1)**k*math.factorial(n+l)*(2**k)*(2*s.Ip)**(3/4+l/2+k/2)*pmod**l
+            term3=(1j*pE)**((2+k+2*l)/4)
+            term4=math.factorial(n-l-k-1)*math.factorial(k)*math.gamma(3/2+l)*math.gamma(1+l+k/2)            
+            if k==0:
+                term5=math.gamma((2+2*l)/4)              
+            elif k==1:
+                F1=complex(mp.hyper([-1/4.,1/4.],[1/2.,(5+2*l)/4.],s.Ip**2/(1j*pE)))
+                F2=complex(mp.hyper([1/4.,3/4.],[3/2.,(7+2*l)/4.],s.Ip**2/(1j*pE)))
+                term5=math.gamma((3+2*l)/4)*F1-sqrt(4*s.Ip**2/(1j*pE))*math.gamma((5+2*l)/4)*F2/(3+2*l)
+            else:
+                return np.nan
+            sum1=sum1+term2*term5/(term3*term4)   
+            
+        term1=(-1j)**l*math.sqrt(math.factorial(n-l-1)/(2*n*math.factorial(n+l)))
+            
+        if m>=0:
+            Yml=sqrt((2*l+1)*math.factorial(l-m)/(4*np.pi*math.factorial(m+l))) 
+            Yml=Yml*lpmn(m,l,pz_2.imag/pmod.imag)[0][m][l]  
+        else: 
+            #Yml=sqrt((2*l+1)*math.factorial(l-m)/(4*np.pi*math.factorial(m+l)))
+            #Yml=Yml*(-1)**abs(m)*(math.factorial(l-abs(m))/math.factorial(l+abs(m)))*clpmn(abs(m),l,pz_2/pmod)[0][abs(m)][l] 
+            Yml=sqrt((2*l+1)*math.factorial(l-abs(m))/(4*np.pi*math.factorial(abs(m)+l)))
+            Yml=Yml*lpmn(abs(m),l,pz_2.imag/pmod.imag)[0][abs(m)][l]  
+            Yml=((-1)**abs(m))*np.conj(Yml)           
+        pref=term1*Yml*sum1
+        
+        return pref
+    
+    
+    
     
 
-    
     @cython.boundscheck(False) # turn off bounds-checking for entire function  
     @cython.wraparound(False)  # turn off negative index wrapping for entire function
     #@functools.lru_cache(maxsize=cacheSize)
-    cpdef double complex M(s, double p, double theta, double phi, double tf = np.inf):#double pz, double px, double t, int N, int eLim):
+    cpdef double complex M(s, double p, double theta, double phi, double tf = np.inf):
         '''
             Final transition amplitude
             Constructed as sum 
@@ -327,19 +472,36 @@ cdef class SFALinearPulse:
         cdef double complex MSum = 0.
         times = s.TimesGen(p, theta, phi)
         
+        # single saddle point (maximum of E**2)
+        #Emax2 = np.amax([np.abs(s.Ef(ts))**2 for ts in times])
+        #for ts in times:
+            #if np.abs(s.Ef(ts))**2 == Emax2:
+                #ts_max = ts
+        #times = [ts_max]
+        # comment the previous lines to compute for all saddle points
+        #Efs = [s.Ef(real(ts)) for ts in times]
+        #its = np.argmax(np.abs(Efs))
         for ts in times:
-            if(real(ts)<tf):
+            if(real(ts)<tf) :#and -s.Ef(real(ts))>0. :
                 det = sqrt(2*Pi*I1/s.DDS(p, theta, phi, ts))
                 expS = exp(I1*s.S(p, theta, phi, ts))
-                d0 = s.d0(p, theta, phi, ts)
+                if s.Gauge==0:
+                    d0 = s.d0_v(s.n,s.l,s.m,s.const1,p,theta,phi)
+                elif s.Gauge==1:
+                    d0 = s.d0_l(s.n,s.l,s.m,s.const1,p,theta,phi,ts)
+                else:
+                    return np.nan
                 MSum += d0*det*expS
         return MSum
+
     #transition amplitude in cartesian co-ordinates
     cpdef double complex Mxy(s, px, py, pz, tf = np.inf):
         cdef double p = sqrt_re(px*px + py*py +pz*pz)
         cdef double theta = acos_re(pz/p)
         cdef double phi = atan2_re(py, px)
         return s.M(p, theta, phi, tf)
+
+    
     #list comprehension over cartesian transition amplitude
     @cython.boundscheck(False) # turn off bounds-checking for entire function
     @cython.wraparound(False)  # turn off negative index wrapping for entire function
@@ -348,11 +510,17 @@ cdef class SFALinearPulse:
     
     def Mxz_List(s, pxList, double py, pzList, tf = np.inf):
         return np.array([s.Mxy(px, py, pz, tf) for px, pz in zip(pxList, pzList)])
-   
-    ####   ---   OAM Functions   ---   #### 
+    
+    def Myz_List(s, double px, pyList, pzList, tf = np.inf):
+        return np.array([s.Mxy(px, py, pz, tf) for py, pz in zip(pyList, pzList)])
+    
+    
+    
+    
+    
     cpdef Ml(s, double p, double theta, int Nphi = 250):
         '''
-            This is the fourier series coeiffint of M to get the OAM distribusion.
+            This is the fourier series coefficient of M to get the OAM distribusion.
             It is computed taking advantage of the FFT
         '''
         phiList = np.linspace(-Pi, Pi, Nphi)
@@ -371,107 +539,275 @@ cdef class SFALinearPulse:
         cdef double p = sqrt_re(px*px +pz*pz)
         cdef double theta = acos_re(pz/p)
         return s.Ml(p, theta, Nphi)
-    
+
     @cython.boundscheck(False) # turn off bounds-checking for entire function
     @cython.wraparound(False)  # turn off negative index wrapping for entire function
     def Mlxz_List(s, pxList, pzList, Nphi = 250):
         return np.array([[abs(M)**2 for M in s.Mlxz(px, pz, Nphi)] for px, pz in zip(pxList, pzList)])
+    
+    
+
+    
+    
+    cpdef double complex Ml_av(s, double p, double theta, int n, int l, int OAM, double tf = np.inf):
+        '''
+            OAM transition amplitude taking advantage of the conservation law OAM=m
+        '''
+        phi = 0. #redundant for linearly polarized field
+        
+        cdef double complex MSum = 0.
+        times = s.TimesGen(p, theta, phi)
+
+        for ts in times:
+            if(real(ts)<tf):
+                det = sqrt(2*Pi*I1/s.DDS(p, theta, phi, ts))
+                expS = exp(I1*s.S(p, theta, phi, ts))
+                if s.Gauge==0:
+                    d0 = s.Vm_v(n,l,OAM,p,theta)
+                elif s.Gauge==1:
+                    d0 = s.Vm_l(n,l,OAM,p,theta,ts)
+                else:
+                    return np.nan
+                MSum += d0*det*expS
+        MSum = MSum*1j**OAM
+        return MSum
+    
+
+    cpdef Mlxz_av(s, px, pz, int n, int l, int OAM):
+        '''
+        convert Ml_av to cartesian coordinates
+        '''
+        cdef double p = sqrt_re(px*px +pz*pz)
+        cdef double theta = acos_re(pz/p)
+        return s.Ml_av(p, theta, n, l, OAM)
+    
+
+    cpdef coeff_av(s, int l, int m, int enant):
+        '''
+        Wave function coefficient depending on l,m and the enantiomer
+            enant=0 (enantiomer +)
+            enant=1 (enantiomer -)
+        '''   
+        if enant==0:
+            if l==2 and m==1:
+                coeff=1
+            elif l== 3 and m==1:
+                coeff=1j
+            elif l==2 and m==-1:
+                coeff=-1
+            elif l==3 and m==-1:
+                coeff=1j
+            else:
+                coeff=0.          
+        elif enant==1:    
+            if l==2 and m==-1:
+                coeff=1
+            elif l== 3 and m==-1:
+                coeff=1j
+            elif l==2 and m==1:
+                coeff=-1
+            elif l==3 and m==1:
+                coeff=1j
+            else:
+                coeff=0.
+        else:
+            coeff=np.nan      
+        return coeff/2.
+
+    
+    cpdef aligned_av(s, double px, double pz, int OAM, int enant=0):
+        cdef double p = sqrt_re(px*px +pz*pz)
+        cdef double theta = acos_re(pz/p)
+        n = 4
+        Msum = 0.
+        N = 10
+        alphaList = np.linspace(0, 2*Pi, N)
+        
+        for alpha in alphaList:
+            for l,m in zip(s.l,s.m):
+                if(m==OAM):
+                    Msum=Msum+s.coeff_av(l,m,enant)*s.Ml_av(p, theta, n, l, OAM)
+                    
+        return Msum
+        
  
+    cpdef orientation_av(s, double px, double pz, int OAM, int enant=0):
+        '''
+        Orientation averaging of f(rho)|M_l|^2 with f(rho)=3*cos^2(beta) 
+        '''      
+        n=4
+        cdef double complex integral = 0.
+            
+        for l,m in zip(s.l, s.m):
+            integral=integral+abs(s.Mlxz_av(px, pz, n, l, OAM))**2/(2*l+1)
+            m2=OAM
+            for l2 in s.l:
+                term1=np.conj(s.coeff_av(l2, m, enant))*s.coeff_av(l, m, enant)*(-1)**(m2-m)
+                if abs(m2)<=l and abs(m2)<=l2:
+                    term2=np.conj(s.Mlxz_av(px, pz, n, l2, m2))*s.Mlxz_av(px, pz, n, l, m2)
+                else:
+                    term2=0.
+                term3=float(wigner_3j(2, l, l2, 0, m2, -m2))*float(wigner_3j(2, l, l2, 0, m, -m))
+                integral=integral+2.*term1*term2*term3
+           
+        return integral
+    
+    
+    def aligned_av_list(s, pxList, pzList, int OAM, int enant=0):
+        return np.array([abs(s.aligned_av(px, pz, OAM, enant))**2 for px, pz in zip(pxList, pzList)])
+        
+    def orientation_av_list(s, pxList, pzList, int OAM, int enant=0):
+        return np.array([abs(s.orientation_av(px, pz, OAM, enant))**2 for px, pz in zip(pxList, pzList)])
+ 
+
+
  #####   ---   code for spectra
     cpdef double Spectra(s, double E, double phi = 0., double t = np.inf, double err = 1.0e-4, int limit = 500):
-        '''Function for the spectra'''    
+        '''Function to check the SFA spectrum looks OK'''    
         Norm_val, Norm_error = it.quad(s.Spec_Norm, 0, Pi, args = (phi, E, t), epsabs=err, epsrel=err, limit=limit  )    
+        return Norm_val
+    
+    cpdef double Spectra2(s, double E, double theta1, double theta2, double phi = 0., double t = np.inf, double err = 1.0e-4, int limit = 500):
+        '''Function to check the SFA spectrum looks OK (with limits of integration)'''   
+        Norm_val, Norm_error = it.quad(s.Spec_Norm, theta1, theta2, args = (phi, E, t), epsabs=err, epsrel=err, limit=limit  )    
         return Norm_val
      
     #Spectra Norm integrand
     cpdef double Spec_Norm(s, double theta, double phi, double E, double t = np.inf):
-        '''Function to compute the integrand of the theta integral for the 'spectra''''
+        '''Function to compute the integrand of the theta integral for the classical 'spectrum' Fisher info'''
         #phrased in spherical coordinates
         #cdef double complex M, Mg
         cdef double px, pr
         pr = sqrt_re(2*E)
-        px = pr*sin_re(theta)
-        
+        px = pr*sin_re(theta)       
         return abs(s.M(pr, theta, phi, t))**2 *px * 2*Pi
-
-######   ---   Funcitons for the analytic monochromatic approximation to pulse   ---   #####
-# ### This will no longer work as this was written for a circular field
-
-
-#     cpdef Ml_Mono(s, double p, double theta, l):
-#         '''
-#                 function to return the fully analytic monchromatic approximation to 
-#         '''
-#         cdef double E1 = (2*s.Ip+2*s.Up+p*p)
-#         #compute prefactor
-#         cdef double part1 = E1*E1/(4*p*p*sin_re(theta))
-#         cdef double complex DDS = p*s.omega*sqrt(2*s.Up-part1)*sin_re(theta)
-#         cdef double complex pref = sqrt(2*Pi*I/DDS)
-
-#         #compute action
-#         cdef double complex S0_1 = E1*acos(E1/(2*s.rt2Up*p*sin_re(theta))-1e-16 * I) #selecting +ive imaginary part branch of acos
-#         cdef double S0_2 = sqrt_re(E1*E1+4*p*p*s.Up*(cos_re(2*theta)-1))
-#         cdef double complex S0 = (S0_1 - I*S0_2)/(2*s.omega)
-
-#         #compute sinc
-#         sinc_val = np.sinc((E1-2*s.omega*l)/(2*s.omega))
-
-#         #compute ATI rings
-#         cdef double complex OM = (exp(I*s.N*Pi*E1/s.omega)-1)/(exp(I*Pi*E1/s.omega)-1)
-#         #print('OM = ',OM,', pref = ',pref,', S0 = ',S0_1/(2*s.omega),', sinc = ',sinc_val)
-#         return OM*pref*exp(I*S0)*sinc_val
-         
     
-# ######   ---   Here functions are defined for the analytical fourier series computation   ---   #####
-# ### This will no longer work as this was written for a circular field
+    cpdef double M_integrand(s, double theta, double E, int index_OAM, int Nphi=9):  
+        cdef double px, pr
+        pr = sqrt_re(2*E)
+        px = pr*sin_re(theta) 
+        return abs(s.Ml(pr, theta, Nphi)[index_OAM])**2 *px*2*Pi
+    
+    cpdef double M_integration(s, double E, double theta1, double theta2, int index_OAM, double err = 1.0e-4, int limit = 500, int Nphi=9):
+        '''Function to compute the integrand of the theta integral for the OAM transition amplitude'''
+        Norm_val, Norm_error = it.quad(s.M_integrand, theta1, theta2, args = (E,index_OAM,Nphi), epsabs=err, epsrel=err, limit=limit  )   
+        return Norm_val
+    
 
-#     cdef double OAM_S(s, double p, double theta, int l, double t):
-#         '''
-#             Action for the analytical OAM action
-#         '''
-#         cdef double constTerms = (s.Ip + 0.5*p*p)*t
-#         cdef double quadTerms = 0 if (t<0 or t>2*s.N*Pi/s.omega) else -0.5*s.Af2I(t)
-#         cdef double trigTerm = 0 if (t<0 or t>2*s.N*Pi/s.omega) else atan2_re(s.AfxI(t), s.AfyI(t))*l
-        
-#         return constTerms + quadTerms + trigTerm 
     
-#     cpdef double complex OAM_Integrand(s, double t, double p, double theta, int l):
-#         cdef double S1 = s.OAM_S(p, theta, l, t)
-#         cdef double complex exp_S = exp(I*S1)
-#         cdef AI_abs = 0 if (t<0 or t>2*s.N*Pi/s.omega) else sqrt_re(s.AfxI(t)**2 + s.AfyI(t)**2)
-#         cdef double BesJ = sp.jv(l, p*sin_re(theta)*AI_abs) 
-        
-#         return BesJ*exp_S
     
-#     cpdef double OAM_IntegrandRe(s, double t, double p, double theta, int l):
-#         cdef double S1 = s.OAM_S(p, theta, l, t)
-#         cdef double cos_S = cos_re(S1)
-#         cdef AI_abs = 0 if (t<0 or t>2*s.N*Pi/s.omega) else sqrt_re(s.AfxI(t)**2 + s.AfyI(t)**2)
-#         cdef double BesJ = sp.jv(l, p*sin_re(theta)*AI_abs) 
-        
-#         return BesJ*cos_S
+    cpdef double M_integrand_align(s, double theta, double E, int OAM, int enant=0):  
+        cdef double px, pr
+        pr = sqrt_re(2*E)
+        px = pr*sin_re(theta) 
+        pz = pr*cos_re(theta)
+        return abs(s.aligned_av(px, pz, OAM, enant))**2 *px*2*Pi
     
-#     cpdef double OAM_IntegrandIm(s, double t, double p, double theta, int l):
-#         cdef double S1 = s.OAM_S(p, theta, l, t)
-#         cdef double sin_S = sin_re(S1)
-#         cdef AI_abs = 0 if (t<0 or t>2*s.N*Pi/s.omega) else sqrt_re(s.AfxI(t)**2 + s.AfyI(t)**2)
-#         cdef double BesJ = sp.jv(l, p*sin_re(theta)*AI_abs) 
-        
-#         return BesJ*sin_S
+    cpdef double M_integration_align(s, double E, double theta1, double theta2, int OAM, double err = 1.0e-4, int limit = 500, int enant=0):
+        '''Function to compute the integrand of the theta integral for the OAM transition amplitude aligned'''
+        Norm_val, Norm_error = it.quad(s.M_integrand_align, theta1, theta2, args = (E,OAM,enant), epsabs=err, epsrel=err, limit=limit  )   
+        return Norm_val    
     
-#     cpdef double complex OAM_Ml(s, double p, double theta, int l, double err = 1.0e-4, int limit = 2000):
-#         cdef double valRe, valIm, errorRe, errorIm
-#         valRe, errorRe = it.quad(s.OAM_IntegrandRe, 0, 2*s.N*Pi/s.omega, args = (p, theta, l), epsabs=err, epsrel=err, limit=limit  )
-#         valIm, errorIm = it.quad(s.OAM_IntegrandIm, 0, 2*s.N*Pi/s.omega, args = (p, theta, l), epsabs=err, epsrel=err, limit=limit  )
-#         #tList = np.linspace(0, 2*s.N*Pi/s.omega, Nt)
-#         #MtList = [s.OAM_Integrand(t, p, theta, l) for t in tList]
-        
-#         return valRe + I*valIm#[valRe + I*valIm, errorRe + I*errorIm]#np.fft.fft(MphiList)/Nphi
     
-#     @cython.boundscheck(False) # turn off bounds-checking for entire function
-#     @cython.wraparound(False)  # turn off negative index wrapping for entire function
-#     def OAM_M_List(s, pList, theta, l, err = 1.0e-4, limit = 2000):
-#         return np.array([np.abs(s.OAM_Ml(p, theta, l, err, limit))**2 for p in pList])
+    
+    cpdef double M_integrand_av(s, double theta, double E, int OAM, int enant=0):  
+        cdef double px, pr
+        pr = sqrt_re(2*E)
+        px = pr*sin_re(theta) 
+        pz = pr*cos_re(theta)
+        return abs(s.orientation_av(px, pz, OAM, enant))**2 *px*2*Pi
+    
+    cpdef double M_integration_av(s, double E, double theta1, double theta2, int OAM, double err = 1.0e-4, int limit = 500, int enant=0):
+        '''Function to compute the integrand of the theta integral for the OAM transition amplitude orientation averaged'''
+        Norm_val, Norm_error = it.quad(s.M_integrand_av, theta1, theta2, args = (E,OAM,enant), epsabs=err, epsrel=err, limit=limit  )   
+        return Norm_val
+    
+    
+    
+    
+#EXACT INTEGRATION 
+####################################################################################################################################
+    cpdef double complex d0_vl(s, nlist, llist, mlist, constlist, double p, double theta, double phi, double ts):   
+        '''prefactor length gauge exact integration''' 
+        cdef double px=p*sin_re(theta)*cos_re(phi), py=p*sin_re(theta)*sin_re(phi), pz=p*cos_re(theta)
+        cdef double pmod = sqrt_re(px**2+py**2+(pz+s.Af(ts))**2)
+        cdef double pz_2 = pz+s.Af(ts)
+        cdef double theta2 = acos_re(pz_2/pmod)
+        
+        cdef double complex pref=0.
+        for n,l,m,const in zip(nlist,llist,mlist,constlist):
+            sum1=0.
+            for k in range(n-l):
+                term1=(-1)**k*math.factorial(n+l)*(2**k)*(2*s.Ip)**((-0.5-l)/2)*pmod**l
+                term2=math.factorial(n-l-k-1)*math.factorial(2*l+k+1)*math.factorial(k)
+                term3=math.gamma(2+k+2*l)/math.gamma(3/2+l)
+                term4=hyp2f1(1+l+k/2,(3+k+2*l)/2, l+3/2,-pmod**2/(2*s.Ip))
+                sum1=sum1+term1*term3*term4/term2
+            term5=(-1j)**l*math.sqrt(math.factorial(n-l-1)/(2*n*math.factorial(n+l)))
+            Yml=sph_harm(m,l,phi,theta2)
+            pref=pref+term5*Yml*sum1*const
+        pref=pref/math.sqrt(len(nlist))
+        return pref
+    
+
+    
+    cpdef double S_exact_integrand(s, double tau, double p, double theta):
+        cdef double S_0 = p*cos_re(theta)*s.Af(tau) + 0.5*(s.Af(tau))**2
+        return S_0
+    
+    cpdef double S_exact(s, double t, double p, double theta):
+        '''
+            Action as given by the SFA with exact integration
+        '''
+        S_1 = (s.Ip + 0.5*p*p)*t 
+        S_integral,S_error = it.quad(s.S_exact_integrand, 0., t, args=(p,theta), limit=1000)
+        return S_1+S_integral
+    
+    cpdef double S_exactxy(s, double px, double py, double pz, double t):
+        cdef double p = sqrt_re(px*px + py*py +pz*pz)
+        cdef double theta = acos_re(pz/p)
+        cdef double phi = atan2_re(py, px)
+        return s.S_exact(t, p, theta)
+    
+    cpdef double M_exact_integrand(s, double tau, double p, double theta, double phi, int x):
+
+        if s.Gauge==0:
+            d0 = s.d0_v(s.n,s.l,s.m,s.const1,p,theta,phi)
+        else:
+            d0 = s.d0_vl(s.n,s.l,s.m,s.const1,p,theta,phi,tau)
+            
+        M_0 = exp(1j*s.S(p, theta, phi, tau))#d0
+        if x==0:
+            return M_0.real
+        return M_0.imag
+    
+    cpdef double complex M_exact(s, double p, double theta, double phi, double t):
+        '''
+            Transition amplitude M with exact integration
+        '''    
+        M_integral1,M_error1 = it.quad(s.M_exact_integrand, 0., t, args=(p,theta,phi,0), limit=1000)
+        M_integral2,M_error2 = it.quad(s.M_exact_integrand, 0., t, args=(p,theta,phi,1), limit=1000)
+        cdef double complex bound1 = 1./( 1j*(s.Ip + 0.5*p*p))
+        cdef double complex bound2 = np.exp(1j*s.N*Pi*(8*s.Ip + 4*p*p + 3*s.Up)/(4*s.omega))/(1j*(s.Ip + 0.5*p*p))
+        #tList=np.linspace(0, t, 1000)
+        #M_integral1array=[s.M_exact_integrand(tau, p, theta, phi, 0) for tau in tList]
+        #M_integral2array=[s.M_exact_integrand(tau, p, theta, phi, 1) for tau in tList]
+        
+        #M_integral1 = np.trapz(M_integral1array) + it.quad(s.M_exact_integrand, t, np.inf, args=(p,theta,phi,0), limit=1000)
+        #M_integral2  = np.trapz(M_integral2array) + it.quad(s.M_exact_integrand, t, np.inf, args=(p,theta,phi,1), limit=1000)
+        return M_integral1+1j*M_integral2 + bound1 - bound2
+    
+    cpdef double complex M_exactxy(s, double px, double py, double pz, double tf):
+        '''
+            Transition amplitude M with exact integration in cartesian coorindinates
+        '''    
+        cdef double p = sqrt_re(px*px + py*py +pz*pz)
+        cdef double theta = acos_re(pz/p)
+        cdef double phi = atan2_re(py, px)
+        return s.M_exact(p, theta, phi, tf)
+####################################################################################################################################
+    
+
 
         
-        
+  
