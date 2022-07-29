@@ -17,7 +17,13 @@ A '.pyx' file is a cython file that uses the flexibility of python but with part
 
 The SFALinearPulse.pyx file codes a python class called SFALinearPulse. As the name suggests it implements the SFA for a linear polarized laser field with a sin^2 pulse.
 
-### Class member functions
+## Publicaton Specific information
+### Ultrafast imaging of molecular chirality with photoelectron vortices
+Available at https://arxiv.org/abs/2202.07289
+The generation and plotting scripts: PublicationScripts/Gen_PEVD_SFA_Data.py and PublicationScripts/load_and_plot_SFA.py
+
+# Information on the Code
+## Class member functions
 The only accessible member functions from outside the class are those with cpdef  or def in front of them. Those with only cdef are internal and can not be called outside the class. The most important functions are:
 
 - Af(t) vector potential in z direction
